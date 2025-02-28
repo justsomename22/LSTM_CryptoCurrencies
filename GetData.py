@@ -1,3 +1,4 @@
+# GetData.py
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
@@ -13,7 +14,8 @@ crypto_tickers = [
     "ethereum",
     "litecoin",
     "ripple",
-    "cardano"
+    "cardano",
+    "monero"
 ]
 
 # Set start date to 365 days ago to comply with CoinGecko's free tier limitations
