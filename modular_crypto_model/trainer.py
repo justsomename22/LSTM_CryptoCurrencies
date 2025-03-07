@@ -1,861 +1,1228 @@
 #trainer.py
 import torch
+import torch.nn as nn
 import numpy as np
 import pandas as pd
 from torch.utils.data import DataLoader, TensorDataset
-import optuna
-from sklearn.model_selection import train_test_split, KFold
-from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler
-from tqdm import tqdm
 import os
+import logging
+from datetime import datetime, timedelta
+from sklearn.preprocessing import RobustScaler
+from tqdm import tqdm
 import pickle
-import torch.nn as nn
-import math
-
-from data_processing import add_technical_indicators, normalize_and_fill_data, add_advanced_features
-from models import ImprovedCryptoLSTM
+import traceback
 from utils import EarlyStopping
+from data_processing import add_technical_indicators, normalize_and_fill_data, add_advanced_features, add_target_columns
 
-# Define SimpleLSTM at module level
-class SimpleLSTM(nn.Module):
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("crypto_trainer.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("CryptoTrainer")
+
+class SimpleLSTM(nn.Module):    
     """
-    Simple LSTM model for cryptocurrency prediction.
+    Simple LSTM model for cryptocurrency price prediction.
+
+    Attributes:
+        input_dim (int): Number of input features.
+        hidden_dim (int): Number of hidden units in the LSTM layer.
+        num_layers (int): Number of LSTM layers.
+        dropout (float): Dropout rate for regularization.
+        output_dim (int): Number of output features.
+        is_direction (bool): If True, applies sigmoid activation for binary classification.
     """
     def __init__(self, input_dim, hidden_dim=64, num_layers=1, dropout=0.1, output_dim=1, is_direction=False):
-        super(SimpleLSTM, self).__init__()
+        super().__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, dropout=dropout, batch_first=True)
         self.fc = nn.Linear(hidden_dim, output_dim)
-        self.is_direction = is_direction
         self.sigmoid = nn.Sigmoid() if is_direction else nn.Identity()
 
     def forward(self, x):
-        lstm_out, _ = self.lstm(x)
-        out = self.fc(lstm_out[:, -1, :])
-        return self.sigmoid(out)
-
-# Define Positional Encoding for Transformer
-class PositionalEncoding(nn.Module):
-    """
-    Positional encoding for Transformer models to maintain temporal order.
-    """
-    def __init__(self, d_model, max_len=5000, dropout=0.1):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        # Create positional encoding matrix
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        
-        # For each dimension, calculate the appropriate frequency
-        for i in range(0, d_model, 2):
-            # Calculate frequency for this dimension
-            div_term = math.exp(-(i) * math.log(10000.0) / d_model)
-            
-            # Apply sin to even indices
-            pe[:, i] = torch.sin(position.squeeze(-1) * div_term)
-            
-            # Apply cos to odd indices (if still within bounds)
-            if i + 1 < d_model:  # Check if we've reached the dimension limit
-                pe[:, i + 1] = torch.cos(position.squeeze(-1) * div_term)
-        
-        # Store without batch dimension for flexibility
-        self.register_buffer('pe', pe)
-        self.d_model = d_model
-
-    def forward(self, x):
         """
-        Args:
-            x: Tensor, shape [batch_size, seq_len, embedding_dim]
-        """
-        # Apply positional encoding to the sequence length dimension, not batch dimension
-        seq_len = x.size(1)
-        pos_encoding = self.pe[:seq_len, :]
-        
-        # Add positional encoding to each position in the sequence across all batches
-        x = x + pos_encoding.unsqueeze(0)
-        return self.dropout(x)
+        Forward pass through the LSTM model.
 
-# Define Transformer Model
+        Parameters:
+            x (Tensor): Input tensor of shape (batch_size, sequence_length, input_dim).
+
+        Returns:
+            Tensor: Output predictions.
+        """
+        try:
+            lstm_out, _ = self.lstm(x)
+            return self.sigmoid(self.fc(lstm_out[:, -1, :]))
+        except Exception as e:
+            logger.error(f"Error in SimpleLSTM forward pass: {str(e)}")
+            raise
+
 class CryptoTransformer(nn.Module):
-    """
-    Transformer model for cryptocurrency price prediction.
-    """
-    def __init__(self, input_dim, d_model=64, n_heads=8, num_layers=2, 
-                 dropout=0.1, sequence_length=20, prediction_type='price'):
+    def __init__(self, input_dim, d_model=64, n_heads=4, num_layers=1, dropout=0.1, sequence_length=10, prediction_type='price'):
         super().__init__()
-        
-        # Store original d_model for reference
-        self.original_d_model = d_model
-        
-        # Ensure d_model is divisible by n_heads
         if d_model % n_heads != 0:
-            # Adjust d_model to be divisible by n_heads
-            d_model = ((d_model + n_heads - 1) // n_heads) * n_heads
-            print(f"Adjusted d_model to {d_model} to be divisible by {n_heads} heads")
-        
-        # Store the adjusted d_model
-        self.adjusted_d_model = d_model
+            logger.warning(f"d_model ({d_model}) is not divisible by n_heads ({n_heads}). Adjusting d_model.")
             
+        self.d_model = d_model if d_model % n_heads == 0 else ((d_model + n_heads - 1) // n_heads) * n_heads
         self.prediction_type = prediction_type
-        self.input_embedding = nn.Linear(input_dim, d_model)
-        self.pos_encoder = PositionalEncoding(d_model, max_len=sequence_length, dropout=dropout)
-        
-        encoder_layers = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads, 
-                                                  dropout=dropout, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
-        
-        self.output_layer = nn.Linear(d_model, 1)
-        
+        self.input_embedding = nn.Linear(input_dim, self.d_model)
+        self.pos_encoder = nn.Dropout(dropout)  # Simplified: no full PositionalEncoding
+        encoder_layer = nn.TransformerEncoderLayer(d_model=self.d_model, nhead=n_heads, dropout=dropout, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.output_layer = nn.Linear(self.d_model, 1)
+
     def forward(self, x):
-        # x shape: [batch_size, seq_len, features]
-        x = self.input_embedding(x)  # [batch_size, seq_len, d_model]
-        x = self.pos_encoder(x)  # Add positional encoding
-        x = self.transformer_encoder(x)  # Apply transformer
-        
-        # Get the last timestep for prediction
-        x = x[:, -1, :]  # [batch_size, d_model]
-        
-        # Output layer
-        x = self.output_layer(x)  # [batch_size, 1]
-        
-        if self.prediction_type == 'direction':
-            x = torch.sigmoid(x)
-            
-        return x.squeeze(-1)
+        try:
+            x = self.input_embedding(x)
+            x = self.pos_encoder(x)
+            x = self.transformer_encoder(x)
+            x = self.output_layer(x[:, -1, :])
+            return torch.sigmoid(x.squeeze(-1)) if self.prediction_type == 'direction' else x.squeeze(-1)
+        except Exception as e:
+            logger.error(f"Error in CryptoTransformer forward pass: {str(e)}")
+            raise
+
+class ModelNotFoundError(Exception):
+    """Exception raised when a model for a specific crypto ID is not found."""
+    pass
+
+class DataPreparationError(Exception):
+    """Exception raised when there is an error in data preparation."""
+    pass
+
+class ModelTrainingError(Exception):
+    """Exception raised when there is an error in model training."""
+    pass
 
 class ImprovedCryptoTrainer:
     """
-    Improved trainer class for managing the training and evaluation of cryptocurrency prediction models.
+    Trainer class for managing the training process of cryptocurrency prediction models.
+
+    Attributes:
+        data_path (str): Path to the dataset.
+        crypto_ids (list): List of cryptocurrency IDs to train on.
+        sequence_length (int): Length of input sequences for the model.
+        test_size (float): Proportion of data to use for testing.
+        target_column (str): The target column to predict (e.g., 'price').
+        device (str): Device to run the model on ('cpu' or 'cuda').
+        batch_size (int): Number of samples per batch.
+        epochs (int): Number of training epochs.
+        model_type (str): Type of model to use ('lstm' or 'transformer').
+        verbosity (int): Level of logging verbosity.
+        cache (bool): Whether to use cached data.
+        use_garch (bool): Whether to include GARCH volatility features in the model.
+        use_bollinger (bool): Whether to include Bollinger Bands indicators in the model.
+        use_macd (bool): Whether to include MACD indicators in the model.
+        use_moving_avg (bool): Whether to include Moving Average indicators in the model.
     """
-    def __init__(self, data_path, crypto_ids=None, sequence_length=20, test_size=0.2, 
-                 target_column='price', device=None, batch_size=32, epochs=100, model_type='lstm',
-                 verbosity=1):
-        """
-        Initialize the trainer with data and model type
+    def __init__(self, data_path, crypto_ids=None, sequence_length=10, test_size=0.2, target_column='price',
+                 device=None, batch_size=128, epochs=20, model_type='transformer', verbosity=1, cache=False, 
+                 use_garch=True, use_bollinger=True, use_macd=True, use_moving_avg=True):
+        # Initialize device
+        self.device = None
+        try:
+            if device:
+                self.device = device
+            else:
+                self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            logger.info(f"Using device: {self.device}")
+        except Exception as e:
+            logger.error(f"Error setting device: {str(e)}. Defaulting to CPU.")
+            self.device = 'cpu'
         
-        Parameters:
-        - data_path (str): Path to the cryptocurrency data CSV file
-        - crypto_ids (list): List of cryptocurrency IDs to train models for
-        - sequence_length (int): Length of the input sequences
-        - test_size (float): Proportion of data to use for testing
-        - target_column (str): Target column to predict ('price' or 'direction')
-        - device (str): Device to use for training ('cuda' or 'cpu')
-        - batch_size (int): Batch size for training
-        - epochs (int): Maximum number of training epochs
-        - model_type (str): Type of model to use ('lstm' or 'transformer')
-        - verbosity (int): Level of output verbosity (0=minimal, 1=normal, 2=detailed)
-        """
-        # Set device
-        self.device = device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"Using device: {self.device}")
-        
-        # Store parameters
+        # Initialize other parameters
         self.sequence_length = sequence_length
         self.test_size = test_size
         self.target_column = target_column
         self.batch_size = batch_size
         self.epochs = epochs
-        self.model_type = model_type.lower()  # 'lstm' or 'transformer'
+        self.model_type = model_type.lower()
         self.verbosity = verbosity
+        self.cache = cache
+        self.use_garch = use_garch
+        self.use_bollinger = use_bollinger
+        self.use_macd = use_macd
+        self.use_moving_avg = use_moving_avg
         
-        # Validate model_type
-        if self.model_type not in ['lstm', 'transformer']:
-            raise ValueError(f"Invalid model_type: {model_type}. Must be 'lstm' or 'transformer'.")
+        if self.use_garch:
+            logger.info("GARCH volatility modeling enabled")
+        else:
+            logger.info("GARCH volatility modeling disabled")
+            
+        if self.use_bollinger:
+            logger.info("Bollinger Bands indicators enabled")
+        else:
+            logger.info("Bollinger Bands indicators disabled")
+            
+        if self.use_macd:
+            logger.info("MACD indicators enabled")
+        else:
+            logger.info("MACD indicators disabled")
+            
+        if self.use_moving_avg:
+            logger.info("Moving Average indicators enabled")
+        else:
+            logger.info("Moving Average indicators disabled")
         
-        # Initialize containers
+        # Validate model type
+        if not (self.model_type in ['lstm', 'transformer'] or 
+                self.model_type.startswith('ensemble_') or 
+                self.model_type.startswith('feature_')):
+            error_msg = f"Invalid model type: {self.model_type}. Must be 'lstm', 'transformer', or an ensemble/feature variant."
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        # Initialize data-related attributes
         self.data = None
         self.crypto_ids = crypto_ids
-        self.X_train = {}
-        self.y_train = {}
-        self.X_val = {}
-        self.y_val = {}
-        self.X_test = {}
-        self.y_test = {}
-        self.best_params = {}
-        self.test_metrics = {}
-        
-        # Storage for models and data
-        self.scalers = {}
         self.best_models = {}
-        self.data_by_crypto = {}
-        self.feature_columns = None
-        self.performance_metrics = {}
+        self.scalers = {}
         self.target_transforms = {}
+        self.data_by_crypto = {}
+        self.test_metrics = {}
+        self.model_timestamps = {}
         
-        # Load and prepare data
-        self.prepare_data(data_path)
-        
-        # Default model parameters
-        self.model_params = {
-            'hidden_size': 32 if self.model_type == 'lstm' else 32,  # d_model for transformer
-            'num_layers': 2,
-            'dropout': 0.2,
-            'n_heads': 2 if self.model_type == 'transformer' else None  # Only for transformer
-        }
-            
+        # Prepare data
+        try:
+            if not os.path.exists(data_path):
+                raise FileNotFoundError(f"Data file not found: {data_path}")
+            self.prepare_data(data_path)
+        except FileNotFoundError as e:
+            logger.error(f"File not found: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Error during initialization: {str(e)}")
+            logger.debug(traceback.format_exc())
+            raise DataPreparationError(f"Failed to initialize trainer: {str(e)}")
+
     def prepare_data(self, data_path):
         """
-        Load and prepare data for training
-        
+        Prepare and preprocess the data for training.
+
         Parameters:
-        - data_path (str): Path to the cryptocurrency data
+            data_path (str): Path to the CSV data file.
+
+        Raises:
+            DataPreparationError: If there is an error in data preparation.
         """
-        # Load data
+        logger.info(f"Preparing data from {data_path}")
+        
+        # Try loading cached data if available
+        if self.cache and self.crypto_ids:
+            try:
+                all_cached = True
+                for cid in self.crypto_ids:
+                    if not all(os.path.exists(f"{cid}_{file}") for file in 
+                              ["X_train.npy", "y_train.npy", "X_test.npy", "y_test.npy", "scaler.pkl", "target_scaler.pkl"]):
+                        all_cached = False
+                        break
+                
+                if all_cached:
+                    logger.info("Loading cached preprocessed data...")
+                    for crypto_id in self.crypto_ids:
+                        try:
+                            self.data_by_crypto[crypto_id] = {
+                                'X_train': np.load(f"{crypto_id}_X_train.npy"),
+                                'y_train': np.load(f"{crypto_id}_y_train.npy"),
+                                'X_test': np.load(f"{crypto_id}_X_test.npy"),
+                                'y_test': np.load(f"{crypto_id}_y_test.npy"),
+                            }
+                            
+                            with open(f"{crypto_id}_scaler.pkl", 'rb') as f:
+                                self.scalers[crypto_id] = pickle.load(f)
+                                
+                            with open(f"{crypto_id}_target_scaler.pkl", 'rb') as f:
+                                self.target_transforms[crypto_id] = pickle.load(f)
+                                
+                        except Exception as e:
+                            logger.error(f"Error loading cached data for {crypto_id}: {str(e)}")
+                            all_cached = False
+                            break
+                            
+                    if all_cached:
+                        logger.info("Successfully loaded all cached data.")
+                        return
+                    else:
+                        logger.warning("Failed to load some cached data. Processing data from scratch.")
+            except Exception as e:
+                logger.error(f"Error checking cached data: {str(e)}")
+                logger.info("Proceeding with data processing from scratch.")
+
+        # Process data from scratch
         try:
             self.data = pd.read_csv(data_path)
-            print(f"Data loaded successfully. Shape: {self.data.shape}")
+            logger.info(f"Loaded data with shape: {self.data.shape}")
             
-            self.data['date'] = pd.to_datetime(self.data['date'])
+            if 'date' not in self.data.columns:
+                raise DataPreparationError("'date' column not found in dataset")
+                
+            self.data['date'] = pd.to_datetime(self.data['date'], errors='coerce')
+            
+            # Check for NaT values after conversion
+            if self.data['date'].isna().any():
+                invalid_dates = self.data.loc[self.data['date'].isna(), :].index.tolist()
+                logger.warning(f"Found {len(invalid_dates)} invalid date entries. First few: {invalid_dates[:5]}")
+                self.data = self.data.dropna(subset=['date'])
+                logger.info(f"Dropped rows with invalid dates. New shape: {self.data.shape}")
+                
+            if 'crypto_id' not in self.data.columns:
+                raise DataPreparationError("'crypto_id' column not found in dataset")
+                
             if self.crypto_ids is None:
                 self.crypto_ids = self.data['crypto_id'].unique().tolist()
+                logger.info(f"Found {len(self.crypto_ids)} unique crypto IDs")
             
-            self.data = normalize_and_fill_data(self.data)
-            self.data = add_technical_indicators(self.data)
-            self.data = add_advanced_features(self.data)
+            try:
+                from data_processing import normalize_and_fill_data, add_technical_indicators, add_advanced_features
+                self.data = normalize_and_fill_data(self.data)
+                self.data = add_technical_indicators(self.data, use_bollinger=self.use_bollinger, use_macd=self.use_macd, use_moving_avg=self.use_moving_avg)
+                self.data = add_target_columns(self.data)
+                # Add GARCH and other advanced features if enabled
+                if self.use_garch:
+                    logger.info("Adding GARCH volatility features to data")
+                    self.data = add_advanced_features(self.data)
+                else:
+                    logger.info("Skipping GARCH volatility features")
+            except ImportError as e:
+                logger.error(f"Failed to import data_processing module: {str(e)}")
+                raise
+            except Exception as e:
+                logger.error(f"Error in data preprocessing: {str(e)}")
+                raise DataPreparationError(f"Data preprocessing failed: {str(e)}")
             
+            # Process each crypto ID
             for crypto_id in self.crypto_ids:
-                crypto_data = self.data[self.data['crypto_id'] == crypto_id].copy()
-                
-                if len(crypto_data) < 100:
-                    print(f"Warning: Not enough data for {crypto_id}. Skipping.")
-                    continue
-                
-                crypto_data = crypto_data.sort_values('date').reset_index(drop=True)
-                crypto_data = self._apply_r2_enhancing_features(crypto_data)
-                
-                if self.feature_columns is None:
-                    numeric_cols = crypto_data.select_dtypes(include=[np.number]).columns.tolist()
-                    self.feature_columns = [col for col in numeric_cols if col != self.target_column and col not in ['date', 'crypto_id', 'index']]
-                
-                train_size = int(len(crypto_data) * (1 - self.test_size))
-                train_data = crypto_data.iloc[:train_size]
-                test_data = crypto_data.iloc[train_size:]
-                
-                X_train_raw = train_data[self.feature_columns].values
-                X_test_raw = test_data[self.feature_columns].values
-                
-                scaler = RobustScaler()
-                X_train_scaled = scaler.fit_transform(X_train_raw)
-                X_test_scaled = scaler.transform(X_test_raw)
-                self.scalers[crypto_id] = scaler
-                
-                y_train_raw = train_data[self.target_column].values
-                y_test_raw = test_data[self.target_column].values
-                
-                target_scaler = RobustScaler()
-                y_train_scaled = target_scaler.fit_transform(y_train_raw.reshape(-1, 1)).flatten()
-                y_test_scaled = target_scaler.transform(y_test_raw.reshape(-1, 1)).flatten()
-                self.target_transforms[crypto_id] = target_scaler
-                
-                X_train_seq, y_train_seq = self._create_sequences(X_train_scaled, y_train_scaled, self.target_column == 'direction')
-                X_test_seq, y_test_seq = self._create_sequences(X_test_scaled, y_test_scaled, self.target_column == 'direction')
-                
-                self.data_by_crypto[crypto_id] = {
-                    'train_data': train_data,
-                    'test_data': test_data,
-                    'X_train': X_train_seq,
-                    'y_train': y_train_seq,
-                    'X_test': X_test_seq,
-                    'y_test': y_test_seq,
-                    'y_test_raw': y_test_raw,
-                    'feature_names': self.feature_columns
-                }
-                
-                print(f"Prepared data for {crypto_id}. Train sequences: {X_train_seq.shape}, Test sequences: {X_test_seq.shape}")
+                try:
+                    crypto_data = self.data[self.data['crypto_id'] == crypto_id].sort_values('date')
+                    logger.info(f"{crypto_id} - Raw rows: {len(crypto_data)}")
+                    
+                    train_size = int(len(crypto_data) * (1 - self.test_size))
+                    logger.info(f"{crypto_id} - Train rows: {train_size}, Test rows: {len(crypto_data) - train_size}")
+                    
+                    train_data, test_data = crypto_data.iloc[:train_size], crypto_data.iloc[train_size:]
+                    
+                    # Expanded feature set including GARCH volatility features if enabled
+                    features = ['price', 'rsi', 'volatility_7d']
+                    
+                    # Add GARCH features if they exist in the data and GARCH is enabled
+                    if self.use_garch:
+                        garch_features = ['garch_vol', 'garch_vol_forecast', 'garch_regime']
+                        for feature in garch_features:
+                            if feature in crypto_data.columns:
+                                features.append(feature)
+                                logger.info(f"Added GARCH feature: {feature}")
+                    
+                    # Add Bollinger Bands features if they exist in the data and Bollinger Bands are enabled
+                    if self.use_bollinger:
+                        bollinger_features = ['bollinger_mavg', 'bollinger_hband', 'bollinger_lband', 
+                                            'bollinger_width', 'bollinger_pct_b', 
+                                            'dist_to_upper', 'dist_to_lower']
+                        for feature in bollinger_features:
+                            if feature in crypto_data.columns:
+                                features.append(feature)
+                                logger.info(f"Added Bollinger Bands feature: {feature}")
+                    
+                    # Add MACD features if they exist in the data and MACD is enabled
+                    if self.use_macd:
+                        macd_features = ['macd_line', 'macd_signal', 'macd_hist', 'macd_divergence']
+                        for feature in macd_features:
+                            if feature in crypto_data.columns:
+                                features.append(feature)
+                                logger.info(f"Added MACD feature: {feature}")
+                    
+                    # Add Moving Average features if they exist in the data and Moving Averages are enabled
+                    if self.use_moving_avg:
+                        ma_features = [
+                            # Simple Moving Averages
+                            'sma_5', 'sma_10', 'sma_20', 'sma_50', 'sma_200',
+                            # Exponential Moving Averages
+                            'ema_5', 'ema_10', 'ema_20', 'ema_50', 'ema_200',
+                            # Moving Average Crossover Signals
+                            'ma_cross_50_200', 'ma_cross_10_50', 'ma_cross_5_20',
+                            # Price vs EMA
+                            'price_vs_ema_20',
+                            # Percent distance from moving averages
+                            'pct_from_sma_50', 'pct_from_sma_200'
+                        ]
+                        for feature in ma_features:
+                            if feature in crypto_data.columns:
+                                features.append(feature)
+                                logger.info(f"Added Moving Average feature: {feature}")
+                    
+                    # Check if all required features exist
+                    missing_features = [f for f in features if f not in crypto_data.columns]
+                    if missing_features:
+                        logger.error(f"Missing features for {crypto_id}: {missing_features}")
+                        continue
+                    
+                    X_train_raw, X_test_raw = train_data[features].values, test_data[features].values
+                    
+                    # Check for NaN values
+                    if np.isnan(X_train_raw).any() or np.isnan(X_test_raw).any():
+                        logger.warning(f"NaN values found in {crypto_id} data. Filling with zeros.")
+                        X_train_raw = np.nan_to_num(X_train_raw, nan=0.0)
+                        X_test_raw = np.nan_to_num(X_test_raw, nan=0.0)
+                    
+                    scaler = RobustScaler()
+                    X_train_scaled = scaler.fit_transform(X_train_raw)
+                    X_test_scaled = scaler.transform(X_test_raw)
+                    self.scalers[crypto_id] = scaler
+                    
+                    if self.target_column not in train_data.columns:
+                        logger.error(f"Target column '{self.target_column}' not found in {crypto_id} data")
+                        continue
+                        
+                    y_train_raw, y_test_raw = train_data[self.target_column].values, test_data[self.target_column].values
+                    target_scaler = RobustScaler()
+                    y_train_scaled = target_scaler.fit_transform(y_train_raw.reshape(-1, 1)).flatten()
+                    y_test_scaled = target_scaler.transform(y_test_raw.reshape(-1, 1)).flatten()
+                    self.target_transforms[crypto_id] = target_scaler
+                    
+                    # Create sequences
+                    X_train_seq, y_train_seq = self._create_sequences(X_train_scaled, y_train_scaled)
+                    X_test_seq, y_test_seq = self._create_sequences(X_test_scaled, y_test_scaled)
+                    
+                    # Log the number of sequences created
+                    logger.info(f"{crypto_id} - Train sequences: {len(X_train_seq)}, Test sequences: {len(X_test_seq)}")
+                    
+                    if len(X_train_seq) == 0 or len(X_test_seq) == 0:
+                        logger.warning(f"No sequences created for {crypto_id}. Skipping.")
+                        continue
+                    elif len(X_train_seq) < self.batch_size or len(X_test_seq) < self.batch_size:
+                        logger.info(f"{crypto_id} has fewer sequences than batch_size ({len(X_train_seq)} train, {len(X_test_seq)} test), but proceeding.")
+                    
+                    self.data_by_crypto[crypto_id] = {
+                        'X_train': X_train_seq, 'y_train': y_train_seq,
+                        'X_test': X_test_seq, 'y_test': y_test_seq
+                    }
+                    
+                    logger.info(f"Successfully processed {crypto_id} data. Train: {X_train_seq.shape}, Test: {X_test_seq.shape}")
+                    
+                    # Save cached data if requested
+                    if self.cache:
+                        try:
+                            np.save(f"{crypto_id}_X_train.npy", X_train_seq)
+                            np.save(f"{crypto_id}_y_train.npy", y_train_seq)
+                            np.save(f"{crypto_id}_X_test.npy", X_test_seq)
+                            np.save(f"{crypto_id}_y_test.npy", y_test_seq)
+                            with open(f"{crypto_id}_scaler.pkl", 'wb') as f:
+                                pickle.dump(scaler, f)
+                            with open(f"{crypto_id}_target_scaler.pkl", 'wb') as f:
+                                pickle.dump(target_scaler, f)
+                            logger.info(f"Cached data for {crypto_id}")
+                        except Exception as e:
+                            logger.error(f"Failed to cache data for {crypto_id}: {str(e)}")
+                            
+                except Exception as e:
+                    logger.error(f"Error processing data for {crypto_id}: {str(e)}")
+                    logger.debug(traceback.format_exc())
             
-            print("Data preparation completed.")
+            if not self.data_by_crypto:
+                raise DataPreparationError("No valid crypto data could be processed")
+                
+            logger.info(f"Data preparation complete. Processed {len(self.data_by_crypto)} crypto IDs.")
+            
         except Exception as e:
-            print(f"Error in data preparation: {str(e)}")
-            raise
+            logger.error(f"Error in data preparation: {str(e)}")
+            logger.debug(traceback.format_exc())
+            raise DataPreparationError(f"Failed to prepare data: {str(e)}")
 
-    def _apply_r2_enhancing_features(self, data):
+    def _create_sequences(self, data, target, is_classification=False):
         """
-        Apply additional features to enhance R2 score
-        
+        Create sequences from the data for time series prediction.
+
         Parameters:
-        - data (pd.DataFrame): DataFrame to enhance
-        
+            data (np.ndarray): Input data.
+            target (np.ndarray): Target values.
+            is_classification (bool): If True, indicates classification task.
+
         Returns:
-        - pd.DataFrame: Enhanced DataFrame
+            Tuple[np.ndarray, np.ndarray]: Tuple of sequences and corresponding targets.
         """
-        df = data.copy()
-        
-        # Add more complex indicators for better R2
         try:
-            # Price momentum features
-            df['price_momentum'] = df['price'].pct_change(5) / df['price'].pct_change(1)
-            df['price_acceleration'] = df['price'].pct_change(1).diff(1)
-            
-            # Volatility based features
-            df['volatility_ratio'] = df['volatility_7d'] / df['volatility_30d']
-            
-            # Mean reversion features
-            for window in [7, 14, 30]:
-                # Z-score (how many std devs price is from moving average)
-                ma = df['price'].rolling(window).mean()
-                std = df['price'].rolling(window).std()
-                df[f'z_score_{window}'] = (df['price'] - ma) / std
+            if len(data) <= self.sequence_length:
+                raise ValueError(f"Data length ({len(data)}) must be greater than sequence length ({self.sequence_length})")
                 
-                # Distance from moving average
-                df[f'ma_distance_{window}'] = (df['price'] - ma) / ma
+            X, y = [], []
+            for i in range(len(data) - self.sequence_length):
+                X.append(data[i:i + self.sequence_length])
+                y.append(target[i + self.sequence_length])
             
-            # Polynomial features of key indicators
-            for indicator in ['rsi', 'macd', 'volatility_7d']:
-                if indicator in df.columns:
-                    df[f'{indicator}_squared'] = df[indicator] ** 2
+            if not X or not y:
+                raise ValueError("Failed to create sequences, empty result")
+                
+            return np.array(X), np.array(y)
             
-            # Interaction terms
-            if 'rsi' in df.columns and 'macd' in df.columns:
-                df['rsi_macd_interaction'] = df['rsi'] * df['macd']
-            
-            # Support and resistance features
-            df['high_low_ratio'] = df['price'].rolling(20).max() / df['price'].rolling(20).min()
-            
-            # Fill NAs created by these calculations
-            numeric_cols = df.select_dtypes(include=[np.number]).columns
-            df[numeric_cols] = df[numeric_cols].fillna(method='bfill').fillna(method='ffill').fillna(0)
         except Exception as e:
-            print(f"Warning: Error applying R2 enhancing features: {str(e)}")
-        
-        return df
-
-    def _create_sequences(self, data, target_col_idx, is_classification=False):
-        """
-        Create sequences for time series prediction
-        
-        Parameters:
-        - data (np.ndarray): Feature data
-        - target_col_idx (np.ndarray): Target data
-        - is_classification (bool): Whether this is a classification task
-        
-        Returns:
-        - tuple: (X_sequences, y_sequences)
-        """
-        X, y = [], []
-        
-        for i in range(len(data) - self.sequence_length):
-            X.append(data[i:i + self.sequence_length])
-            y.append(target_col_idx[i + self.sequence_length])
-        
-        return np.array(X), np.array(y)
+            logger.error(f"Error creating sequences: {str(e)}")
+            raise DataPreparationError(f"Sequence creation failed: {str(e)}")
 
     def create_dataloader(self, X, y, batch_size=None, shuffle=True):
         """
-        Create PyTorch DataLoader
-        
+        Create a DataLoader for the training or validation data.
+
         Parameters:
-        - X (np.ndarray): Feature data
-        - y (np.ndarray): Target data
-        - batch_size (int): Batch size
-        - shuffle (bool): Whether to shuffle the data
-        
+            X (np.ndarray): Input features.
+            y (np.ndarray): Target values.
+            batch_size (int, optional): Batch size for the DataLoader.
+            shuffle (bool): Whether to shuffle the data.
+
         Returns:
-        - DataLoader: PyTorch DataLoader
-        """
-        if batch_size is None:
-            batch_size = self.batch_size
-            
-        # Convert to PyTorch tensors
-        X_tensor = torch.FloatTensor(X)
-        y_tensor = torch.FloatTensor(y.reshape(-1, 1) if len(y.shape) == 1 else y)
-        
-        # Create TensorDataset
-        dataset = TensorDataset(X_tensor, y_tensor)
-        
-        # Create DataLoader
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
-        
-        return dataloader
-
-    def optimize_hyperparameters(self, crypto_id, X_train, y_train, n_trials=20):
-        """
-        Optimize hyperparameters for a specific cryptocurrency model.
-        """
-        print(f"Optimizing hyperparameters for {crypto_id}...")
-        
-        # Create a validation set for optimization
-        train_size = int(0.8 * len(X_train))
-        X_train_opt, X_val_opt = X_train[:train_size], X_train[train_size:]
-        y_train_opt, y_val_opt = y_train[:train_size], y_train[train_size:]
-        
-        # Create a study
-        study = optuna.create_study(direction="minimize")
-        
-        def objective(trial):
-            if self.model_type == 'transformer':
-                n_heads = trial.suggest_int('n_heads', 2, 4)  # Reduced from 2-8
-                d_model_min = max(32, n_heads * 4)
-                d_model_max = 128  # Reduced from 256
-                d_model = trial.suggest_int('d_model', d_model_min, d_model_max, step=n_heads)
-                
-                params = {
-                    'd_model': d_model,
-                    'n_heads': n_heads,
-                    'num_layers': trial.suggest_int('num_layers', 1, 2),  # Reduced from 1-4
-                    'dropout': trial.suggest_float('dropout', 0.1, 0.3),  # Reduced from 0.1-0.5
-                    'learning_rate': trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True),  # Adjusted lower bound up
-                    'weight_decay': trial.suggest_float('weight_decay', 1e-5, 1e-3, log=True),  # Adjusted lower bound up
-                    'batch_size': trial.suggest_categorical('batch_size', [32, 64, 128]),  # Removed 16, favoring larger batches
-                    'optimizer': trial.suggest_categorical('optimizer', ['Adam', 'RMSprop'])  # Removed AdamW for simplicity
-                }
-            else:  # LSTM
-                params = {
-                    'hidden_size': trial.suggest_int('hidden_size', 16, 64),  # Reduced from 32-256
-                    'num_layers': trial.suggest_int('num_layers', 1, 2),  # Reduced from 1-3
-                    'dropout': trial.suggest_float('dropout', 0.1, 0.3),  # Reduced from 0.1-0.5
-                    'learning_rate': trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True),
-                    'weight_decay': trial.suggest_float('weight_decay', 1e-5, 1e-3, log=True),
-                    'batch_size': trial.suggest_categorical('batch_size', [32, 64, 128]),
-                    'optimizer': trial.suggest_categorical('optimizer', ['Adam', 'RMSprop'])
-                }
-            
-            # Create model based on type
-            if self.model_type == 'transformer':
-                original_d_model = params.get('d_model', 64)
-                
-                model = CryptoTransformer(
-                    input_dim=X_train.shape[2],
-                    d_model=original_d_model,
-                    n_heads=params.get('n_heads', 4),
-                    num_layers=params.get('num_layers', 2),
-                    dropout=params.get('dropout', 0.1),
-                    sequence_length=self.sequence_length,
-                    prediction_type=self.target_column
-                ).to(self.device)
-                
-                # Log if d_model was adjusted
-                if hasattr(model, 'adjusted_d_model') and model.adjusted_d_model != original_d_model:
-                    # Update the params dictionary with the actual value used
-                    params['d_model'] = model.adjusted_d_model
-                    
-                    # Only try to access trial if we're in an optimization context
-                    # Check if 'trial' variable exists in local scope (during optimization)
-                    if 'trial' in locals() or 'trial' in globals():
-                        # Store original d_model in trial's user_attrs for reference
-                        trial.set_user_attr('original_d_model', original_d_model)
-                        if self.verbosity >= 1:
-                            print(f"Trial #{trial.number}: d_model adjusted from {original_d_model} to {model.adjusted_d_model} to be divisible by n_heads={params.get('n_heads', 4)}")
-                    else:
-                        # We're not in optimization context, just print the info
-                        if self.verbosity >= 1:
-                            print(f"d_model adjusted from {original_d_model} to {model.adjusted_d_model} to be divisible by n_heads={params.get('n_heads', 4)}")
-            else:
-                model = ImprovedCryptoLSTM(
-                    input_dim=X_train.shape[2],
-                    hidden_dim=params['hidden_size'],
-                    num_layers=params['num_layers'],
-                    dropout=params['dropout'],
-                    output_dim=1,
-                    sequence_length=self.sequence_length,
-                    prediction_type=self.target_column
-                ).to(self.device)
-            
-            # Select optimizer
-            if params['optimizer'] == 'Adam':
-                optimizer = torch.optim.Adam(model.parameters(), lr=params['learning_rate'], weight_decay=params['weight_decay'])
-            else:
-                optimizer = torch.optim.RMSprop(model.parameters(), lr=params['learning_rate'], weight_decay=params['weight_decay'])
-            
-            # Define loss function
-            criterion = torch.nn.HuberLoss(delta=1.0) if self.target_column != 'direction' else torch.nn.BCELoss()
-            
-            # Create dataloaders with suggested batch size
-            train_loader_trial = self.create_dataloader(X_train_opt, y_train_opt, batch_size=params['batch_size'])
-            val_loader_trial = self.create_dataloader(X_val_opt, y_val_opt, batch_size=params['batch_size'], shuffle=False)
-            
-            # Train for a few epochs
-            early_stopping = EarlyStopping(patience=5, min_delta=0.001, verbose=False)
-            best_val_loss = float('inf')
-            
-            for epoch in range(10):
-                model.train()
-                train_loss = 0
-                for inputs, targets in train_loader_trial:
-                    inputs, targets = inputs.to(self.device), targets.to(self.device)
-                    inputs = inputs.float()
-                    targets = targets.float().view(-1, 1)
-                    
-                    optimizer.zero_grad()
-                    outputs = model(inputs)
-                    loss = criterion(outputs, targets)
-                    loss.backward()
-                    optimizer.step()
-                    train_loss += loss.item()
-                
-                model.eval()
-                val_loss = 0
-                with torch.no_grad():
-                    for inputs, targets in val_loader_trial:
-                        inputs, targets = inputs.to(self.device), targets.to(self.device)
-                        inputs = inputs.float()
-                        targets = targets.float().view(-1, 1)
-                        outputs = model(inputs)
-                        loss = criterion(outputs, targets)
-                        val_loss += loss.item()
-                
-                val_loss /= len(val_loader_trial)
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                if early_stopping.step(val_loss):
-                    break
-            
-            return best_val_loss
-        
-        optuna_verbosity = 1 if self.verbosity >= 1 else 0
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=self.verbosity >= 2)
-        
-        best_params = study.best_params.copy()
-        best_trial = study.best_trial
-        
-        # Check if there was an adjusted d_model value
-        if 'd_model' in best_params and self.model_type == 'transformer' and best_trial.user_attrs.get('original_d_model') is not None:
-            original_d_model = best_trial.user_attrs['original_d_model']
-            if original_d_model != best_params['d_model']:
-                if self.verbosity >= 1:
-                    print(f"Note: Original d_model={original_d_model} was adjusted to {best_params['d_model']} to be divisible by n_heads={best_params['n_heads']}")
-        
-        if self.verbosity >= 1:
-            print(f"\nBest hyperparameters for {crypto_id}: {best_params}")
-            print(f"Best validation loss: {study.best_value:.6f}")
-        
-        return best_params
-
-    def train_models(self, n_splits=5, optimize=True, n_trials=100):
-        """
-        Train multiple cryptocurrency models with optional cross-validation and hyperparameter optimization.
-        
-        Parameters:
-        - n_splits (int): Number of cross-validation splits
-        - optimize (bool): Whether to optimize hyperparameters
-        - n_trials (int): Number of optimization trials
-        """
-        crypto_ids_to_train = [cid for cid in self.crypto_ids if cid in self.data_by_crypto]
-        
-        if self.verbosity >= 1:
-            print(f"\n{'='*50}\nTraining models for {len(crypto_ids_to_train)} cryptocurrencies\n{'='*50}")
-            crypto_iterator = tqdm(enumerate(crypto_ids_to_train), total=len(crypto_ids_to_train), desc="Cryptocurrencies")
-        else:
-            crypto_iterator = enumerate(crypto_ids_to_train)
-            
-        for i, crypto_id in crypto_iterator:
-            if self.verbosity >= 1:
-                if not isinstance(crypto_iterator, tqdm):
-                    print(f"\n{'='*50}\nTraining model for {crypto_id} ({i+1}/{len(crypto_ids_to_train)})\n{'='*50}")
-            
-            X_train = self.data_by_crypto[crypto_id]['X_train']
-            y_train = self.data_by_crypto[crypto_id]['y_train']
-            X_test = self.data_by_crypto[crypto_id]['X_test']
-            y_test = self.data_by_crypto[crypto_id]['y_test']
-            
-            if optimize:
-                if self.verbosity >= 1:
-                    print(f"\nStarting hyperparameter optimization for {crypto_id}...")
-                best_params = self.optimize_hyperparameters(crypto_id, X_train, y_train, n_trials=n_trials)
-                if self.verbosity >= 1:
-                    print(f"Best parameters for {crypto_id}: {best_params}")
-                    # If d_model was adjusted, make sure to mention this
-                    if self.model_type == 'transformer' and 'd_model' in best_params:
-                        d_model = best_params['d_model']
-                        n_heads = best_params['n_heads']
-                        if d_model % n_heads == 0:
-                            print(f"Verified: d_model={d_model} is divisible by n_heads={n_heads}")
-                self.best_params[crypto_id] = best_params
-            else:
-                if self.verbosity >= 1:
-                    print(f"Using default hyperparameters for {crypto_id}")
-                best_params = self.model_params
-                
-            if n_splits > 1:
-                if self.verbosity >= 1:
-                    print(f"Performing {n_splits}-fold cross-validation for {crypto_id}...")
-                kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
-                cv_scores = []
-                
-                if self.verbosity >= 1:
-                    fold_iterator = tqdm(enumerate(kf.split(X_train)), total=n_splits, desc=f"CV Folds", leave=False)
-                else:
-                    fold_iterator = enumerate(kf.split(X_train))
-                
-                for fold, (train_idx, val_idx) in fold_iterator:
-                    X_train_cv, X_val_cv = X_train[train_idx], X_train[val_idx]
-                    y_train_cv, y_val_cv = y_train[train_idx], y_train[val_idx]
-                    
-                    if self.verbosity >= 1 and not isinstance(fold_iterator, tqdm):
-                        print(f"Training fold {fold+1}/{n_splits}")
-                    
-                    model, metrics = self.train_single_model(crypto_id, {**best_params, 'fold': fold}, trial_num=fold+1)
-                    
-                    if metrics is not None:
-                        cv_scores.append(metrics)
-                    else:
-                        cv_scores.append({'val_loss': float('inf')})
-                
-                # Extract valid val_loss values
-                val_losses = []
-                for score in cv_scores:
-                    if isinstance(score, dict) and 'val_loss' in score:
-                        if isinstance(score['val_loss'], (float, int)):
-                            val_losses.append(score['val_loss'])
-                        elif isinstance(score['val_loss'], list) and score['val_loss']:
-                            # Take the last value if it's a list
-                            val_losses.append(score['val_loss'][-1])
-                
-                if val_losses:
-                    mean_val_loss = np.mean(val_losses)
-                    if self.verbosity >= 1:
-                        print(f"\nCross-validation results for {crypto_id}:")
-                        print(f"Mean validation loss: {mean_val_loss:.6f}")
-            
-            if self.verbosity >= 1:
-                print(f"\nTraining final model for {crypto_id} on all training data...")
-                
-            final_model, final_metrics = self.train_single_model(crypto_id, best_params, trial_num='final')
-            
-            if final_model is not None:
-                self.best_models[crypto_id] = final_model
-                
-                if self.verbosity >= 1:
-                    print(f"Evaluating {crypto_id} model on test set...")
-                    
-                self.X_test[crypto_id] = X_test
-                self.y_test[crypto_id] = y_test
-                
-                test_predictions = self.predict(crypto_id, X_test)
-                
-                if self.target_column == 'direction':
-                    test_predictions = (test_predictions > 0.5).astype(int)
-                
-                if self.target_column == 'price' and crypto_id in self.target_transforms:
-                    test_predictions_2d = test_predictions.reshape(-1, 1)
-                    y_test_2d = y_test.reshape(-1, 1)
-                    test_predictions = self.target_transforms[crypto_id].inverse_transform(test_predictions_2d).flatten()
-                    y_test_actual = self.target_transforms[crypto_id].inverse_transform(y_test_2d).flatten()
-                else:
-                    y_test_actual = y_test
-                
-                mse = np.mean((test_predictions - y_test_actual) ** 2)
-                mae = np.mean(np.abs(test_predictions - y_test_actual))
-                
-                if self.target_column == 'price':
-                    direction_pred = np.diff(test_predictions, prepend=test_predictions[0])
-                    direction_actual = np.diff(y_test_actual, prepend=y_test_actual[0])
-                    direction_accuracy = np.mean((direction_pred > 0) == (direction_actual > 0))
-                    y_mean = np.mean(y_test_actual)
-                    ss_total = np.sum((y_test_actual - y_mean) ** 2)
-                    ss_residual = np.sum((y_test_actual - test_predictions) ** 2)
-                    r2 = 1 - (ss_residual / ss_total) if ss_total != 0 else float('-inf')
-                    self.test_metrics[crypto_id] = {'mse': mse, 'mae': mae, 'direction_accuracy': direction_accuracy, 'r2': r2}
-                else:
-                    accuracy = np.mean(test_predictions == y_test_actual)
-                    self.test_metrics[crypto_id] = {'mse': mse, 'mae': mae, 'accuracy': accuracy}
-                
-                if self.verbosity >= 1:
-                    print(f"Saving model for {crypto_id}...")
-                    
-                torch.save(final_model.state_dict(), f"{crypto_id}_best_model.pth")
-                with open(f"{crypto_id}_best_model_{crypto_id}_{self.target_column}.pkl", 'wb') as f:
-                    pickle.dump(self, f)
-            else:
-                print(f"Warning: Training failed for {crypto_id}. No model to evaluate.")
-        
-        if self.verbosity >= 1:
-            print("\nTraining completed for all cryptocurrencies.")
-            
-    def train_single_model(self, crypto_id, params, trial_num=1):
-        """
-        Train a single cryptocurrency model (LSTM or Transformer).
+            DataLoader: PyTorch DataLoader object.
         """
         try:
+            if X.shape[0] != y.shape[0]:
+                raise ValueError(f"Mismatch between X and y lengths: {X.shape[0]} vs {y.shape[0]}")
+                
+            if batch_size is None:
+                batch_size = min(self.batch_size, X.shape[0])
+                
+            dataset = TensorDataset(torch.FloatTensor(X), torch.FloatTensor(y.reshape(-1, 1)))
+            return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+            
+        except Exception as e:
+            logger.error(f"Error creating dataloader: {str(e)}")
+            raise DataPreparationError(f"DataLoader creation failed: {str(e)}")
+
+    def train_single_model(self, crypto_id, params):
+        """
+        Train a single model for a specific cryptocurrency.
+
+        Parameters:
+            crypto_id (str): The ID of the cryptocurrency to train.
+            params (dict): Additional parameters for training.
+
+        Returns:
+            nn.Module: The trained model.
+        
+        Raises:
+            ModelTrainingError: If there is an error during training.
+        """
+        try:
+            if crypto_id not in self.data_by_crypto:
+                raise ModelTrainingError(f"No data available for {crypto_id}")
+                
+            logger.info(f"Training model for {crypto_id}")
             X_train = self.data_by_crypto[crypto_id]['X_train']
             y_train = self.data_by_crypto[crypto_id]['y_train']
             
             train_size = int(0.8 * len(X_train))
+            if train_size <= 0 or train_size >= len(X_train):
+                raise ModelTrainingError(f"Invalid train/val split for {crypto_id}: {train_size}/{len(X_train) - train_size}")
+                
             X_train_split, X_val_split = X_train[:train_size], X_train[train_size:]
             y_train_split, y_val_split = y_train[:train_size], y_train[train_size:]
             
             input_dim = X_train.shape[2]
-            if self.verbosity >= 1:
-                print(f"Creating model with input dimension: {input_dim}")
             
-            # Create model based on type
-            if self.model_type == 'transformer':
-                original_d_model = params.get('d_model', 64)
-                
-                model = CryptoTransformer(
-                    input_dim=input_dim,
-                    d_model=original_d_model,
-                    n_heads=params.get('n_heads', 4),
-                    num_layers=params.get('num_layers', 2),
-                    dropout=params.get('dropout', 0.1),
-                    sequence_length=self.sequence_length,
-                    prediction_type=self.target_column
-                ).to(self.device)
-                
-                # Log if d_model was adjusted
-                if hasattr(model, 'adjusted_d_model') and model.adjusted_d_model != original_d_model:
-                    # Update the params dictionary with the actual value used
-                    params['d_model'] = model.adjusted_d_model
+            # Check if we're using an ensemble model
+            is_ensemble = self.model_type.startswith('ensemble')
+            ensemble_method = 'average'  # Default method
+            
+            # Parse ensemble method if specified (e.g., 'ensemble_weighted')
+            if is_ensemble and '_' in self.model_type:
+                ensemble_method = self.model_type.split('_')[1]
+                logger.info(f"Using ensemble method: {ensemble_method}")
+            
+            # Check if we're using a feature ensemble
+            is_feature_ensemble = self.model_type.startswith('feature')
+            feature_ensemble_method = 'average'  # Default method
+            
+            # Parse feature ensemble method if specified (e.g., 'feature_average')
+            if is_feature_ensemble and '_' in self.model_type:
+                parts = self.model_type.split('_')
+                if len(parts) > 1:
+                    feature_ensemble_method = parts[1]
+                logger.info(f"Using feature ensemble with method: {feature_ensemble_method}")
+            
+            # Create model
+            try:
+                if is_feature_ensemble:
+                    # Import the feature ensemble model
+                    from models import FeatureEnsemble
                     
-                    # Only try to access trial if we're in an optimization context
-                    # Check if 'trial' variable exists in local scope (during optimization)
-                    if 'trial' in locals() or 'trial' in globals():
-                        # Store original d_model in trial's user_attrs for reference
-                        trial.set_user_attr('original_d_model', original_d_model)
-                        if self.verbosity >= 1:
-                            print(f"Trial #{trial.number}: d_model adjusted from {original_d_model} to {model.adjusted_d_model} to be divisible by n_heads={params.get('n_heads', 4)}")
-                    else:
-                        # We're not in optimization context, just print the info
-                        if self.verbosity >= 1:
-                            print(f"d_model adjusted from {original_d_model} to {model.adjusted_d_model} to be divisible by n_heads={params.get('n_heads', 4)}")
-            else:
-                try:
-                    model = ImprovedCryptoLSTM(
+                    logger.info(f"Creating feature ensemble model with method: {feature_ensemble_method}")
+                    model = FeatureEnsemble(
                         input_dim=input_dim,
-                        hidden_dim=params.get('hidden_size', 128),
-                        num_layers=params.get('num_layers', 2),
-                        dropout=params.get('dropout', 0.3),
+                        hidden_dim=64,
+                        model_type='transformer',  # Use transformer as base model for all feature sets
+                        ensemble_method=feature_ensemble_method,
+                        prediction_type=self.target_column,
+                        use_full_feature_model=True
+                    ).to(self.device)
+                    
+                    # Create feature masks for each feature set
+                    # We need to identify the indices of different feature groups in the input
+                    # This depends on how features are added in prepare_data
+                    
+                    # Initialize all masks with zeros
+                    feature_masks = []
+                    
+                    # Basic price features (always included)
+                    basic_feature_count = 3  # price, rsi, volatility
+                    
+                    # Count feature groups
+                    garch_features = 3 if self.use_garch else 0  # garch_vol, garch_vol_forecast, garch_regime
+                    bollinger_features = 7 if self.use_bollinger else 0  # bollinger_mavg, bollinger_hband, bollinger_lband, etc.
+                    macd_features = 4 if self.use_macd else 0  # macd_line, macd_signal, macd_hist, macd_divergence
+                    ma_features = 3 if self.use_moving_avg else 0  # sma_10, sma_30, sma_diff
+                    
+                    # Calculate starting indices for each feature group
+                    garch_start = basic_feature_count
+                    bollinger_start = garch_start + garch_features
+                    macd_start = bollinger_start + bollinger_features
+                    ma_start = macd_start + macd_features
+                    
+                    # 1. Create mask for price + GARCH features
+                    mask1 = torch.zeros(input_dim)
+                    # Basic features always included
+                    mask1[:basic_feature_count] = 1.0
+                    # Include GARCH features if used
+                    if self.use_garch:
+                        mask1[garch_start:bollinger_start] = 1.0
+                    feature_masks.append(mask1)
+                    
+                    # 2. Create mask for price + Bollinger features
+                    mask2 = torch.zeros(input_dim)
+                    # Basic features always included
+                    mask2[:basic_feature_count] = 1.0
+                    # Include Bollinger features if used
+                    if self.use_bollinger:
+                        mask2[bollinger_start:macd_start] = 1.0
+                    feature_masks.append(mask2)
+                    
+                    # 3. Create mask for price + MACD features
+                    mask3 = torch.zeros(input_dim)
+                    # Basic features always included
+                    mask3[:basic_feature_count] = 1.0
+                    # Include MACD features if used
+                    if self.use_macd:
+                        mask3[macd_start:ma_start] = 1.0
+                    feature_masks.append(mask3)
+                    
+                    # 4. Create mask for price + Moving Average features
+                    mask4 = torch.zeros(input_dim)
+                    # Basic features always included
+                    mask4[:basic_feature_count] = 1.0
+                    # Include Moving Average features if used
+                    if self.use_moving_avg:
+                        mask4[ma_start:] = 1.0
+                    feature_masks.append(mask4)
+                    
+                    # 5. Create mask for all features
+                    mask5 = torch.ones(input_dim)
+                    feature_masks.append(mask5)
+                    
+                    # Set the feature masks in the model
+                    model.set_feature_masks(feature_masks)
+                    
+                    logger.info(f"Created feature masks for {len(feature_masks)} feature sets")
+                
+                elif is_ensemble:
+                    # Import the ensemble model
+                    from models import CryptoEnsemble
+                    
+                    logger.info(f"Creating ensemble model with method: {ensemble_method}")
+                    model = CryptoEnsemble(
+                        input_dim=input_dim,
+                        hidden_dim=64,
+                        models_config=[
+                            {'type': 'lstm', 'layers': 1, 'dropout': 0.1},  # Simple LSTM
+                            {'type': 'gru', 'layers': 2, 'dropout': 0.2},   # GRU
+                            {'type': 'transformer', 'layers': 1, 'heads': 4, 'dropout': 0.1}  # Transformer
+                        ],
+                        ensemble_method=ensemble_method,
+                        prediction_type=self.target_column
+                    ).to(self.device)
+                elif self.model_type == 'transformer':
+                    from models import CryptoTransformer
+                    model = CryptoTransformer(
+                        input_dim=input_dim,
+                        d_model=64,
+                        n_heads=4,
+                        num_layers=3,
+                        dropout=0.1,
                         sequence_length=self.sequence_length,
                         prediction_type=self.target_column
                     ).to(self.device)
-                except Exception as e:
-                    print(f"Error creating ImprovedCryptoLSTM: {str(e)}")
-                    print("Falling back to SimpleLSTM")
-                    is_direction = self.target_column == 'direction'
+                else:  # LSTM
+                    from trainer import SimpleLSTM
                     model = SimpleLSTM(
                         input_dim=input_dim,
-                        hidden_dim=params.get('hidden_size', 64),
-                        num_layers=params.get('num_layers', 1),
-                        dropout=params.get('dropout', 0.1),
-                        is_direction=is_direction
+                        hidden_dim=64,
+                        num_layers=1,
+                        dropout=0.1,
+                        output_dim=1,
+                        is_direction=self.target_column == 'direction'
                     ).to(self.device)
+            except Exception as e:
+                logger.error(f"Error creating model for {crypto_id}: {str(e)}")
+                raise ModelTrainingError(f"Model creation failed: {str(e)}")
             
-            if self.verbosity >= 1:
-                print(f"Model created successfully: {model.__class__.__name__}")
+            # Setup optimizer and criterion
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+            criterion = nn.HuberLoss() if self.target_column == 'price' else nn.BCELoss()
+            logger.info(f"Criterion type: {type(criterion)}")
             
-            criterion = torch.nn.HuberLoss(delta=1.0) if self.target_column != 'direction' else torch.nn.BCELoss()
-            optimizer = torch.optim.Adam(model.parameters(), lr=params.get('learning_rate', 0.001), 
-                                       weight_decay=params.get('weight_decay', 1e-5))
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=self.verbosity >= 2)
+            # Create dataloaders
+            try:
+                train_loader = self.create_dataloader(X_train_split, y_train_split, batch_size=16)
+                val_loader = self.create_dataloader(X_val_split, y_val_split, batch_size=32, shuffle=False)
+            except Exception as e:
+                logger.error(f"Error creating data loaders for {crypto_id}: {str(e)}")
+                raise ModelTrainingError(f"DataLoader creation failed: {str(e)}")
             
-            train_loader = self.create_dataloader(X_train_split, y_train_split, batch_size=params.get('batch_size', 32))
-            val_loader = self.create_dataloader(X_val_split, y_val_split, batch_size=params.get('batch_size', 32), shuffle=False)
-            
-            # Cap epochs at 20
-            epochs = min(self.epochs, 20)
-            patience = params.get('patience', 5)
-            
-            early_stopping = EarlyStopping(patience=patience, min_delta=0.001, verbose=self.verbosity >= 2)
-            epochs = min(self.epochs, 20)
-            
+            # Initialize best validation loss
             best_val_loss = float('inf')
             best_model_state = None
-            training_history = {'train_loss': [], 'val_loss': []}
+            early_stop_count = 0
+            max_early_stop = 5
             
-            if self.verbosity >= 1:
-                print(f"Starting training for {crypto_id} (trial {'final' if trial_num == 'final' else trial_num})...")
-                print(f"Training with {len(train_loader)} batches, validation with {len(val_loader)} batches")
+            # For stacking ensemble, train base models first
+            if is_ensemble and ensemble_method == 'stacking':
+                logger.info("Training base models for ensemble...")
+                self._train_base_models(model, X_train_split, y_train_split, X_val_split, y_val_split, criterion, crypto_id)
+                
+                # Freeze base models for stacking
+                model.freeze_base_models()
+                logger.info("Training meta-model for stacking ensemble...")
             
-            # Use tqdm for progress bar if verbosity >= 1
-            epoch_iterator = tqdm(range(epochs), desc=f"Training {crypto_id}", disable=self.verbosity < 1)
+            # For feature ensemble, train base models separately
+            if is_feature_ensemble:
+                val_losses = self._train_feature_ensemble_models(model, X_train_split, y_train_split, X_val_split, y_val_split, criterion, crypto_id)
+                
+                # Update weights if using weighted ensemble
+                if feature_ensemble_method == 'weighted':
+                    model.update_weights(val_losses)
+                    logger.info(f"Updated feature ensemble weights: {model.weights.data.cpu().numpy()}")
+                
+                # For stacking, freeze base models to train meta-model
+                if feature_ensemble_method == 'stacking':
+                    model.freeze_base_models()
+                    logger.info("Training meta-model for feature stacking ensemble...")
             
-            for epoch in epoch_iterator:
+            # Use automatic mixed precision for faster training if available
+            use_amp = torch.cuda.is_available()
+            scaler = torch.cuda.amp.GradScaler() if use_amp else None
+            
+            # Training loop
+            for epoch in tqdm(range(self.epochs), desc=f"Training {crypto_id}", disable=self.verbosity < 1):
+                try:
+                    # Training phase
+                    model.train()
+                    train_loss = 0
+                    for batch_idx, (inputs, targets) in enumerate(train_loader):
+                        try:
+                            inputs, targets = inputs.to(self.device), targets.to(self.device)
+                            targets = targets.squeeze(-1)
+                            
+                            if use_amp:
+                                with torch.cuda.amp.autocast():
+                                    outputs = model(inputs)
+                                    loss = criterion(outputs, targets)
+                                scaler.scale(loss).backward()
+                                scaler.step(optimizer)
+                                scaler.update()
+                            else:
+                                outputs = model(inputs)
+                                loss = criterion(outputs, targets)
+                                loss.backward()
+                                optimizer.step()
+                                
+                            optimizer.zero_grad()
+                            train_loss += loss.item()
+                            
+                        except Exception as e:
+                            logger.error(f"Error in batch {batch_idx} for {crypto_id}: {str(e)}")
+                            continue
+                    
+                    train_loss /= len(train_loader)
+                    
+                    # Validation phase
+                    val_loss = 0
+                    model.eval()
+                    with torch.no_grad():
+                        for inputs, targets in val_loader:
+                            try:
+                                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                                targets = targets.squeeze(-1)
+                                outputs = model(inputs)
+                                val_loss += criterion(outputs, targets).item()
+                            except Exception as e:
+                                logger.error(f"Error in validation for {crypto_id}: {str(e)}")
+                                continue
+                    
+                    val_loss /= len(val_loader)
+                    logger.info(f"{crypto_id} - Epoch {epoch}: Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+                    
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        best_model_state = model.state_dict()
+                        early_stop_count = 0
+                    else:
+                        early_stop_count += 1
+                        
+                    # For weighted ensemble, update weights based on validation performance of base models
+                    if is_ensemble and ensemble_method == 'weighted' and epoch % 5 == 0:
+                        self._update_ensemble_weights(model, X_val_split, y_val_split, criterion)
+                    
+                    if early_stop_count >= max_early_stop:
+                        logger.info(f"Early stopping for {crypto_id} at epoch {epoch}")
+                        break
+                        
+                except Exception as e:
+                    logger.error(f"Error in epoch {epoch} for {crypto_id}: {str(e)}")
+                    continue
+            
+            # Load best model
+            if best_model_state is not None:
+                model.load_state_dict(best_model_state)
+                logger.info(f"Training completed for {crypto_id}. Best val loss: {best_val_loss:.6f}")
+                return model
+            else:
+                raise ModelTrainingError(f"No valid model state found for {crypto_id}")
+                
+        except Exception as e:
+            logger.error(f"Error training model for {crypto_id}: {str(e)}")
+            logger.debug(traceback.format_exc())
+            raise ModelTrainingError(f"Training failed for {crypto_id}: {str(e)}")
+            
+    def _train_base_models(self, ensemble_model, X_train, y_train, X_val, y_val, criterion, crypto_id):
+        """
+        Train the base models of an ensemble separately.
+        
+        Parameters:
+            ensemble_model (CryptoEnsemble): The ensemble model containing base models.
+            X_train (Tensor): Training features.
+            y_train (Tensor): Training targets.
+            X_val (Tensor): Validation features.
+            y_val (Tensor): Validation targets.
+            criterion (nn.Module): Loss criterion.
+            crypto_id (str): Cryptocurrency ID.
+            
+        Returns:
+            None - modifies the ensemble_model in-place
+        """
+        # Convert to PyTorch tensors
+        X_train_tensor = torch.FloatTensor(X_train).to(self.device)
+        y_train_tensor = torch.FloatTensor(y_train).to(self.device)
+        X_val_tensor = torch.FloatTensor(X_val).to(self.device)
+        y_val_tensor = torch.FloatTensor(y_val).to(self.device)
+        
+        # Create data loaders
+        train_dataset = TensorDataset(X_train_tensor, y_train_tensor.reshape(-1, 1))
+        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
+        
+        val_performances = []
+        
+        # Train each base model separately
+        for i, model in enumerate(ensemble_model.base_models):
+            logger.info(f"Training base model {i+1}/{len(ensemble_model.base_models)} for {crypto_id}")
+            
+            # Create optimizer for this base model
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+            
+            best_val_loss = float('inf')
+            early_stopping = EarlyStopping(patience=3, verbose=self.verbosity >= 2)
+            
+            # Train for fewer epochs for base models
+            for epoch in range(min(10, self.epochs)):
+                # Training
                 model.train()
                 train_loss = 0
-                for batch_idx, (inputs, targets) in enumerate(train_loader):
-                    inputs, targets = inputs.to(self.device), targets.to(self.device)
-                    inputs = inputs.float()
-                    targets = targets.float().view(-1, 1)
-                    
+                for inputs, targets in train_loader:
                     optimizer.zero_grad()
                     outputs = model(inputs)
-                    loss = criterion(outputs, targets)
+                    loss = criterion(outputs, targets.squeeze(-1))
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                     train_loss += loss.item()
                 
-                train_loss /= len(train_loader) if len(train_loader) > 0 else float('inf')
+                train_loss /= len(train_loader)
                 
+                # Validation
                 model.eval()
-                val_loss = 0
                 with torch.no_grad():
-                    for inputs, targets in val_loader:
-                        inputs, targets = inputs.to(self.device), targets.to(self.device)
-                        inputs = inputs.float()
-                        targets = targets.float().view(-1, 1)
-                        outputs = model(inputs)
-                        loss = criterion(outputs, targets)
-                        val_loss += loss.item()
+                    outputs = model(X_val_tensor)
+                    val_loss = criterion(outputs, y_val_tensor).item()
                 
-                val_loss /= len(val_loader) if len(val_loader) > 0 else float('inf')
-                
-                scheduler.step(val_loss)
-                
-                # Update progress bar with loss values
-                if self.verbosity >= 1:
-                    epoch_iterator.set_postfix({"Train Loss": f"{train_loss:.6f}", "Val Loss": f"{val_loss:.6f}"})
-                
-                # Only print detailed epoch logs if verbosity is high
-                if self.verbosity >= 2:
-                    print(f"Epoch {epoch+1}/{epochs}: Train Loss = {train_loss:.6f}, Val Loss = {val_loss:.6f}")
-                
-                training_history['train_loss'].append(train_loss)
-                training_history['val_loss'].append(val_loss)
+                logger.info(f"{crypto_id} - Base Model {i+1} - Epoch {epoch}: Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
                 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    best_model_state = model.state_dict().copy()
-                    if self.verbosity >= 2:
-                        print(f"New best model saved (val_loss: {best_val_loss:.6f})")
                 
                 if early_stopping.step(val_loss):
-                    if self.verbosity >= 1:
-                        print(f"Early stopping triggered after {epoch+1} epochs")
+                    logger.info(f"Early stopping for base model {i+1} at epoch {epoch}")
                     break
             
-            if best_model_state:
-                model.load_state_dict(best_model_state)
-            
-            self.performance_metrics[crypto_id] = {
-                'training_history': training_history,
-                'best_val_loss': best_val_loss,
-                'params': params
-            }
-            
-            return model, training_history
+            val_performances.append(best_val_loss)
         
-        except Exception as e:
-            print(f"Error in train_single_model: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return None, None
+        # Update ensemble weights based on validation performance
+        if ensemble_model.ensemble_method == 'weighted':
+            ensemble_model.update_weights(val_performances)
+            logger.info(f"Updated ensemble weights: {ensemble_model.weights.data.cpu().numpy()}")
     
-    def predict(self, crypto_id, X=None):
+    def _train_feature_ensemble_models(self, ensemble_model, X_train, y_train, X_val, y_val, criterion, crypto_id):
         """
-        Make predictions with the trained model for a given cryptocurrency.
+        Train the base models of a feature ensemble separately.
         
         Parameters:
-        - crypto_id (str): Cryptocurrency ID
-        - X (np.ndarray, optional): Input data for prediction. If None, uses test data.
-        
-        Returns:
-        - np.ndarray: Predictions
-        """
-        if crypto_id not in self.best_models:
-            raise ValueError(f"No trained model found for {crypto_id}")
-        
-        if X is None:
-            if crypto_id not in self.X_test:
-                raise ValueError(f"No test data found for {crypto_id}")
-            X = self.X_test[crypto_id]
-        
-        X_tensor = torch.FloatTensor(X).to(self.device)
-        model = self.best_models[crypto_id]
-        if model is None:
-            raise ValueError(f"Model for {crypto_id} exists but is None. Training likely failed.")
+            ensemble_model (FeatureEnsemble): The feature ensemble model containing base models.
+            X_train (Tensor): Training features.
+            y_train (Tensor): Training targets.
+            X_val (Tensor): Validation features.
+            y_val (Tensor): Validation targets.
+            criterion (nn.Module): Loss criterion.
+            crypto_id (str): Cryptocurrency ID.
             
-        model.eval()
-        with torch.no_grad():
-            predictions = model(X_tensor).cpu().numpy()
-        predictions = predictions.reshape(-1)
-        return predictions 
+        Returns:
+            list: Validation losses for each base model.
+        """
+        try:
+            logger.info("Training feature ensemble base models...")
+            logger.info(f"Criterion type in _train_feature_ensemble_models: {type(criterion)}")
+            logger.info(f"X_train type: {type(X_train)}, y_train type: {type(y_train)}")
+            if isinstance(X_train, torch.Tensor):
+                logger.info(f"X_train shape: {X_train.shape}")
+            if isinstance(y_train, torch.Tensor):
+                logger.info(f"y_train shape: {y_train.shape}")
+            
+            # Convert to PyTorch tensors if they aren't already
+            if not isinstance(X_train, torch.Tensor):
+                X_train = torch.FloatTensor(X_train).to(self.device)
+            if not isinstance(y_train, torch.Tensor):
+                y_train = torch.FloatTensor(y_train).to(self.device)
+            if not isinstance(X_val, torch.Tensor):
+                X_val = torch.FloatTensor(X_val).to(self.device)
+            if not isinstance(y_val, torch.Tensor):
+                y_val = torch.FloatTensor(y_val).to(self.device)
+            
+            logger.info(f"After conversion - X_train type: {type(X_train)}, y_train type: {type(y_train)}")
+            logger.info(f"After conversion - X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
+            
+            # Get base models and feature masks
+            base_models = ensemble_model.base_models
+            feature_masks = ensemble_model.feature_masks
+            feature_sets = ensemble_model.feature_sets
+            
+            # Create dataloaders
+            train_dataset = TensorDataset(X_train, y_train)
+            train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+            
+            val_dataset = TensorDataset(X_val, y_val)
+            val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+            
+            # Train each base model separately
+            val_losses = []
+            for i, model in enumerate(base_models):
+                logger.info(f"Training feature model {i+1}/{len(base_models)} for {crypto_id}: {feature_sets[i]}")
+                
+                # Set up optimizer for this model
+                optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+                mask = feature_masks[i]
+                
+                # Initialize best validation loss
+                best_val_loss = float('inf')
+                early_stop_count = 0
+                max_early_stop = 3  # Stop after 3 epochs without improvement
+                
+                # Train for a few epochs
+                for epoch in range(10):  # Fewer epochs per base model
+                    # Training phase
+                    model.train()
+                    train_loss = 0.0
+                    
+                    for batch_X, batch_y in train_loader:
+                        batch_X, batch_y = batch_X.to(self.device), batch_y.to(self.device)
+                        
+                        # Apply feature mask if available
+                        if mask is not None:
+                            # Create a version of batch_X with only the relevant features
+                            mask_expanded = mask.expand(batch_X.shape[0], batch_X.shape[1], -1).to(self.device)
+                            masked_X = batch_X * mask_expanded
+                            
+                            # Add small values to maintain tensor structure
+                            small_value = 1e-8
+                            inverted_mask = 1.0 - mask_expanded
+                            masked_X = masked_X + (small_value * inverted_mask)
+                            
+                            # Forward pass and compute loss
+                            optimizer.zero_grad()
+                            output = model(masked_X)
+                        else:
+                            # Use all features
+                            optimizer.zero_grad()
+                            output = model(batch_X)
+                        
+                        loss = criterion(output, batch_y)
+                        loss.backward()
+                        optimizer.step()
+                        
+                        train_loss += loss.item()
+                    
+                    train_loss /= len(train_loader)
+                    
+                    # Validation phase
+                    model.eval()
+                    val_loss = 0.0
+                    
+                    with torch.no_grad():
+                        for batch_X, batch_y in val_loader:
+                            batch_X, batch_y = batch_X.to(self.device), batch_y.to(self.device)
+                            
+                            # Apply feature mask if available
+                            if mask is not None:
+                                # Create a version of batch_X with only the relevant features
+                                mask_expanded = mask.expand(batch_X.shape[0], batch_X.shape[1], -1).to(self.device)
+                                masked_X = batch_X * mask_expanded
+                                
+                                # Add small values to maintain tensor structure
+                                small_value = 1e-8
+                                inverted_mask = 1.0 - mask_expanded
+                                masked_X = masked_X + (small_value * inverted_mask)
+                                
+                                # Forward pass
+                                output = model(masked_X)
+                            else:
+                                # Use all features
+                                output = model(batch_X)
+                            
+                            loss = criterion(output, batch_y)
+                            val_loss += loss.item()
+                    
+                    val_loss /= len(val_loader)
+                    
+                    # Log progress
+                    logger.info(f"Epoch {epoch+1}/10, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+                    
+                    # Check for improvement
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        early_stop_count = 0
+                    else:
+                        early_stop_count += 1
+                        if early_stop_count >= max_early_stop:
+                            logger.info(f"Early stopping after {epoch+1} epochs")
+                            break
+                
+                # Store validation loss for this model
+                val_losses.append(best_val_loss)
+                logger.info(f"Model {i+1} best validation loss: {best_val_loss:.4f}")
+            
+            return val_losses
+        except Exception as e:
+            logger.error(f"Error in _train_feature_ensemble_models: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+
+    def _update_ensemble_weights(self, ensemble_model, X_val, y_val, criterion):
+        """
+        Update weights for a weighted ensemble model based on validation performance.
+        
+        Parameters:
+            ensemble_model (CryptoEnsemble): The ensemble model to update weights for
+            X_val (np.ndarray): Validation features
+            y_val (np.ndarray): Validation targets
+            criterion (torch.nn.Module): Loss function
+            
+        Returns:
+            None - modifies the ensemble_model in-place
+        """
+        # Convert to PyTorch tensors
+        X_val_tensor = torch.FloatTensor(X_val).to(self.device)
+        y_val_tensor = torch.FloatTensor(y_val).to(self.device)
+        
+        val_performances = []
+        
+        # Evaluate each base model on validation data
+        for i, model in enumerate(ensemble_model.base_models):
+            model.eval()
+            with torch.no_grad():
+                outputs = model(X_val_tensor)
+                val_loss = criterion(outputs, y_val_tensor).item()
+            val_performances.append(val_loss)
+        
+        # Update weights based on validation performance
+        ensemble_model.update_weights(val_performances)
+        logger.info(f"Updated ensemble weights: {ensemble_model.weights.data.cpu().numpy()}")
+
+    def train_models(self, n_splits=3, optimize=False, n_trials=10):
+        """
+        Train models for all specified cryptocurrencies.
+
+        Parameters:
+            n_splits (int): Number of cross-validation splits.
+            optimize (bool): Whether to optimize hyperparameters.
+            n_trials (int): Number of trials for hyperparameter optimization.
+
+        Returns:
+            dict: Dictionary of best models for each cryptocurrency.
+        """
+        logger.info(f"Training models for {len(self.crypto_ids)} crypto IDs")
+        failed_models = []
+        
+        for crypto_id in self.crypto_ids:
+            try:
+                if crypto_id not in self.data_by_crypto:
+                    logger.warning(f"No data available for {crypto_id}. Skipping.")
+                    continue
+                
+                model = self.train_single_model(crypto_id, {})
+                self.best_models[crypto_id] = model
+                
+                try:
+                    model_path = f"{crypto_id}_best_model.pth"
+                    torch.save(model.state_dict(), model_path)
+                    logger.info(f"Saved model for {crypto_id} to {model_path}")
+                except Exception as e:
+                    logger.error(f"Error saving model for {crypto_id}: {str(e)}")
+                
+                self.model_timestamps[crypto_id] = datetime.now()
+                
+            except Exception as e:
+                logger.error(f"Failed to train model for {crypto_id}: {str(e)}")
+                failed_models.append(crypto_id)
+                
+        if failed_models:
+            logger.warning(f"Training failed for {len(failed_models)} models: {failed_models}")
+            
+        logger.info(f"Model training complete. Successfully trained {len(self.best_models)} models.")
+        return self.best_models
+
+    def predict(self, crypto_id, X=None):
+        """
+        Make predictions using the trained model for a specific cryptocurrency.
+
+        Parameters:
+            crypto_id (str): The ID of the cryptocurrency to predict.
+            X (np.ndarray, optional): Input features for prediction.
+
+        Returns:
+            np.ndarray: Predicted values.
+
+        Raises:
+            ModelNotFoundError: If no model is available for the specified cryptocurrency.
+        """
+        try:
+            if crypto_id not in self.best_models:
+                raise ModelNotFoundError(f"No model available for {crypto_id}")
+                
+            if X is None:
+                if crypto_id not in self.data_by_crypto:
+                    raise DataPreparationError(f"No test data available for {crypto_id}")
+                X = self.data_by_crypto[crypto_id]['X_test']
+                
+            if len(X) == 0:
+                raise ValueError(f"Empty input data for prediction for {crypto_id}")
+                
+            model = self.best_models[crypto_id]
+            model.eval()
+            
+            with torch.no_grad():
+                # Process in batches to avoid memory issues
+                batch_size = 128
+                all_preds = []
+                
+                for i in range(0, len(X), batch_size):
+                    batch_X = X[i:i+batch_size]
+                    batch_tensor = torch.FloatTensor(batch_X).to(self.device)
+                    
+                    try:
+                        preds = model(batch_tensor).cpu().numpy()
+                        
+                        # Handle different output shapes
+                        # If predictions come out as shape (batch_size, 1), flatten to (batch_size,)
+                        if len(preds.shape) > 1 and preds.shape[1] == 1:
+                            preds = preds.flatten()
+                            
+                        all_preds.append(preds)
+                    except Exception as e:
+                        logger.error(f"Error in prediction batch for {crypto_id}: {str(e)}")
+                        logger.error(f"Input tensor shape: {batch_tensor.shape}, Model type: {type(model).__name__}")
+                        # Continue with other batches
+                
+                if not all_preds:
+                    raise ValueError(f"No valid predictions generated for {crypto_id}")
+                
+                try:
+                    # Try to concatenate the predictions
+                    predictions = np.concatenate(all_preds)
+                    
+                    # Check if predictions are empty or malformed
+                    if predictions.size == 0:
+                        raise ValueError(f"Empty predictions array for {crypto_id}")
+                    
+                    # Log prediction shape for debugging
+                    logger.info(f"Predictions shape for {crypto_id}: {predictions.shape}")
+                    
+                    # Make sure predictions match the expected length
+                    expected_length = len(self.data_by_crypto[crypto_id]['y_test'])
+                    if len(predictions) != expected_length:
+                        logger.warning(f"Prediction length mismatch: got {len(predictions)}, expected {expected_length}")
+                        # Adjust prediction length if needed - this handles some edge cases
+                        if len(predictions) > expected_length:
+                            predictions = predictions[:expected_length]
+                        elif len(predictions) < expected_length:
+                            # Pad with last value or zeros
+                            padding = np.zeros(expected_length - len(predictions))
+                            if len(predictions) > 0:
+                                padding[:] = predictions[-1]
+                            predictions = np.concatenate([predictions, padding])
+                    
+                    return predictions
+                except Exception as e:
+                    logger.error(f"Error processing predictions for {crypto_id}: {str(e)}")
+                    # Return an empty array of the correct shape as fallback
+                    return np.array([])
+                
+        except ModelNotFoundError as e:
+            logger.error(str(e))
+            raise
+        except Exception as e:
+            logger.error(f"Error in prediction for {crypto_id}: {str(e)}")
+            logger.debug(traceback.format_exc())
+            raise
+
+    def retrain_if_needed(self, crypto_id, days_threshold=30):
+        """
+        Check if a model needs to be retrained based on its age.
+
+        Parameters:
+            crypto_id (str): The ID of the cryptocurrency to check.
+            days_threshold (int): Number of days after which retraining is needed.
+
+        Returns:
+            bool: True if retraining was performed, False otherwise.
+        """
+        try:
+            needs_retrain = False
+            
+            if crypto_id not in self.model_timestamps:
+                logger.info(f"No timestamp for {crypto_id} model. Retraining required.")
+                needs_retrain = True
+            elif (datetime.now() - self.model_timestamps[crypto_id]).days >= days_threshold:
+                logger.info(f"Model for {crypto_id} is {(datetime.now() - self.model_timestamps[crypto_id]).days} days old. Retraining required.")
+                needs_retrain = True
+                
+            if needs_retrain:
+                logger.info(f"Retraining model for {crypto_id}...")
+                try:
+                    model = self.train_single_model(crypto_id, {})
+                    self.best_models[crypto_id] = model
+                    torch.save(model.state_dict(), f"{crypto_id}_best_model.pth")
+                    self.model_timestamps[crypto_id] = datetime.now()
+                    logger.info(f"Retraining complete for {crypto_id}")
+                    return True
+                except Exception as e:
+                    logger.error(f"Retraining failed for {crypto_id}: {str(e)}")
+                    return False
+            else:
+                logger.info(f"No retraining needed for {crypto_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error checking if retraining needed for {crypto_id}: {str(e)}")
+            return False 

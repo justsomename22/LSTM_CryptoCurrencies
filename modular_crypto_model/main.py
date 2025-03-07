@@ -1,4 +1,10 @@
 #main.py
+"""
+Main entry point for the cryptocurrency prediction pipeline.
+
+This script handles the training and evaluation of models for cryptocurrency price prediction.
+It includes command line argument parsing and logging setup.
+"""
 from evaluation import (
     evaluate_model,
     analyze_model_performance,
@@ -7,7 +13,9 @@ from evaluation import (
     generate_error_distribution_plot,
     predict_future,
     compare_models,
-    generate_anomaly_detection_plot
+    generate_anomaly_detection_plot,
+    visualize_ensemble_predictions,
+    visualize_feature_ensemble
 )
 from trainer import ImprovedCryptoTrainer
 import os
@@ -22,9 +30,19 @@ from typing import List, Dict, Any, Tuple, Optional, Union
 import random
 import time
 from tqdm import tqdm
+import logging  # Import logging
 
-# For testing our fix
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("Main")
+
 def test_transformer_model():
+    """
+    Test the CryptoTransformer model with various batch sizes to ensure it handles input correctly.
+
+    Returns:
+        bool: True if all tests pass, False otherwise.
+    """
     from trainer import CryptoTransformer
     try:
         # Test with small batch size
@@ -51,7 +69,6 @@ def test_transformer_model():
             
             # Test a forward pass
             output = model(test_input)
-            print(f"Output shape: {output.shape}, expected: torch.Size([{batch_size}])")
             
             # Verify the output shape matches the batch size
             assert output.shape == torch.Size([batch_size]), f"Shape mismatch: {output.shape} vs {torch.Size([batch_size])}"
@@ -65,6 +82,12 @@ def test_transformer_model():
         return False
 
 def main(args):
+    """
+    Main function to execute the training and evaluation of models.
+
+    Parameters:
+        args (Namespace): Command line arguments parsed by argparse.
+    """
     # Set random seeds for reproducibility
     torch.manual_seed(42)
     np.random.seed(42)
@@ -72,112 +95,95 @@ def main(args):
     # Create output directory for plots
     os.makedirs("model_evaluation", exist_ok=True)
     
-    # Initialize the trainer
+    # Log data information
+    try:
+        df = pd.read_csv(args.data_path)
+        logger.info(f"Raw data shape: {df.shape}")
+        logger.info(f"Columns: {df.columns.tolist()}")
+        logger.info(f"Rows per crypto: {df.groupby('crypto_id').size().to_dict()}")
+    except Exception as e:
+        logger.error(f"Error reading data file: {str(e)}")
+        return
+    
+    # Check if using an ensemble model
+    is_ensemble = args.model_type.startswith('ensemble')
+    ensemble_type = args.model_type.split('_')[1] if is_ensemble else ''
+    
+    logger.info("Initializing enhanced trainer with GARCH volatility modeling")
+    if is_ensemble:
+        logger.info(f"Using ensemble model with {ensemble_type} method")
+    
+    # Initialize the trainer with specified parameters
     trainer = ImprovedCryptoTrainer(
         data_path=args.data_path,
-        crypto_ids=args.crypto_ids.split(',') if args.crypto_ids else None,
-        sequence_length=args.sequence_length,
-        test_size=args.test_size,
-        target_column=args.target_column,
-        batch_size=args.batch_size,
-        epochs=args.epochs,
+        sequence_length=5,  # Reduced from 10
+        batch_size=16,      # Reduced from 128
+        epochs=20,
         model_type=args.model_type,
-        verbosity=args.verbosity
+        use_garch=args.use_garch,
+        use_bollinger=args.use_bollinger,
+        use_macd=args.use_macd,
+        use_moving_avg=args.use_moving_avg
     )
     
-    # Train models if requested
-    if args.train:
-        print("\n" + "="*70)
-        print("TRAINING CRYPTOCURRENCY MODELS")
-        print("="*70)
-        trainer.train_models(
-            n_splits=args.cv_splits, 
-            optimize=args.optimize, 
-            n_trials=args.n_trials
-        )
+    logger.info(f"Training models with {' enhanced feature set including' if args.use_garch or args.use_bollinger else ' standard features'}{' GARCH volatility modeling' if args.use_garch else ''}{' and' if args.use_garch and args.use_bollinger else ''}{' Bollinger Bands indicators' if args.use_bollinger else ''}{' and MACD indicators' if args.use_macd else ''}{' and Moving Average indicators' if args.use_moving_avg else ''}")
     
-    # Print comprehensive evaluation for each cryptocurrency
+    # Train models
+    trainer.train_models()
+
+    # Existing code for evaluation...
     print("\n" + "="*70)
-    print("COMPREHENSIVE MODEL EVALUATION")
+    features_text = []
+    if args.use_garch:
+        features_text.append("GARCH VOLATILITY")
+    if args.use_bollinger:
+        features_text.append("BOLLINGER BANDS")
+    if args.use_macd:
+        features_text.append("MACD")
+    if args.use_moving_avg:
+        features_text.append("MOVING AVERAGES")
+    
+    features_str = " WITH " + " & ".join(features_text) + " FEATURES" if features_text else ""
+    print(f"COMPREHENSIVE MODEL EVALUATION{features_str}")
     print("="*70)
     
-    # Get list of cryptocurrencies that have trained models
     trained_cryptos = [crypto_id for crypto_id in trainer.crypto_ids if crypto_id in trainer.best_models]
-    
     if not trained_cryptos:
-        print("No cryptocurrency models were successfully trained. Check the training logs for errors.")
+        print("No trained models available. Train models first or check logs.")
         return
-        
-    print(f"Evaluating {len(trained_cryptos)} trained cryptocurrency models: {', '.join(trained_cryptos)}")
+    
+    print(f"Evaluating {len(trained_cryptos)} models: {', '.join(trained_cryptos)}")
     
     for crypto_id in trained_cryptos:
         print(f"\n{'#'*20} Evaluating {crypto_id.upper()} {'#'*20}")
         try:
-            # Calculate all standard metrics
             evaluate_model(trainer, crypto_id)
-            
-            # Perform detailed analysis and display metrics
-            analysis_results = analyze_model_performance(trainer, crypto_id)
-            
-            # Generate plots for the model
-            print(f"\nGenerating visualization plots for {crypto_id}...")
-            
-            # Basic plots
-            plot_path = plot_actual_vs_predicted(
-                trainer, 
-                crypto_id, 
-                save_path=f"model_evaluation/{crypto_id}_actual_vs_predicted.png"
-            )
-            
-            residual_path = generate_residual_plot(
-                trainer, 
-                crypto_id, 
-                save_path=f"model_evaluation/{crypto_id}_residuals.png"
-            )
-            
-            error_dist_path = generate_error_distribution_plot(
-                trainer, 
-                crypto_id, 
-                save_path=f"model_evaluation/{crypto_id}_error_distribution.png"
-            )
-            
-            # Advanced anomaly detection plot
-            anomaly_path = generate_anomaly_detection_plot(
-                trainer,
-                crypto_id,
-                save_path=f"model_evaluation/{crypto_id}_anomalies.png"
-            )
-            
-            # Predict future values
+            analyze_model_performance(trainer, crypto_id)
+            if args.plot:
+                plot_actual_vs_predicted(trainer, crypto_id, f"model_evaluation/{crypto_id}_actual_vs_predicted.png")
+                generate_residual_plot(trainer, crypto_id, f"model_evaluation/{crypto_id}_residuals.png")
+                generate_error_distribution_plot(trainer, crypto_id, f"model_evaluation/{crypto_id}_error_distribution.png")
+                # Generate ensemble visualization if it's an ensemble model
+                if args.model_type.startswith('ensemble'):
+                    visualize_ensemble_predictions(trainer, crypto_id, f"model_evaluation/{crypto_id}_ensemble_comparison.png")
+                # Generate feature ensemble visualization if it's a feature ensemble model
+                if args.model_type.startswith('feature'):
+                    visualize_feature_ensemble(trainer, crypto_id, f"model_evaluation/{crypto_id}_feature_ensemble.png")
             if args.predict_days > 0:
-                print(f"\nGenerating future predictions for {crypto_id} ({args.predict_days} days)...")
-                future_predictions = predict_future(
-                    trainer, 
-                    crypto_id, 
-                    days=args.predict_days, 
-                    plot=True, 
-                    save_path=f"model_evaluation/{crypto_id}_future_prediction.png"
-                )
-            
-            print(f"Successfully completed evaluation for {crypto_id}")
+                predict_future(trainer, crypto_id, days=args.predict_days, plot=args.plot,
+                              save_path=f"model_evaluation/{crypto_id}_future_prediction.png")
+            print(f"Completed evaluation for {crypto_id}")
         except Exception as e:
             print(f"Error evaluating {crypto_id}: {str(e)}")
-            import traceback
-            traceback.print_exc()
     
-    # Compare all models (only if we have multiple models)
     if len(trained_cryptos) > 1:
-        try:
-            print("\nComparing model performance across cryptocurrencies...")
-            # Compare using different metrics
-            for metric in ['mse', 'mae', 'direction_accuracy']:
-                compare_models(trainer, metric=metric)
-        except Exception as e:
-            print(f"Error comparing models: {str(e)}")
-    
-    print("\nEvaluation completed. All plots saved to the 'model_evaluation' directory.")
+        # Only generate comparison plots if plotting is enabled
+        compare_models(trainer, metric='mae', plot=args.plot)
 
 if __name__ == "__main__":
+    """
+    Entry point for the script. Runs the transformer model test and starts the main process.
+    """
     # First run our test to verify the fix
     print("Testing Transformer model...")
     if not test_transformer_model():
@@ -186,7 +192,7 @@ if __name__ == "__main__":
     print("Transformer model test passed. Continuing with execution.")
     
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Train and evaluate cryptocurrency prediction models')
+    parser = argparse.ArgumentParser(description='Cryptocurrency Prediction Pipeline')
     
     # Data parameters
     parser.add_argument('--data_path', type=str, default="cryptocurrency_data.csv", 
@@ -195,25 +201,42 @@ if __name__ == "__main__":
                         help='Comma-separated list of cryptocurrency IDs to train (e.g., "bitcoin,ethereum")')
     
     # Model parameters
-    parser.add_argument('--model_type', type=str, default='transformer', choices=['lstm', 'transformer'],
-                       help='Type of model to use (lstm or transformer)')
+    # ensemble_average best performance
+    parser.add_argument('--model_type', type=str, default='feature_average', 
+                       choices=['lstm', 'transformer', 
+                                'ensemble_average', 'ensemble_weighted', 'ensemble_stacking',
+                                'feature_average', 'feature_weighted', 'feature_stacking'],
+                       help='Type of model to use (lstm, transformer, ensemble variants, or feature ensemble variants)')
+    parser.add_argument('--use_garch', action='store_true', default=True,
+                       help='Whether to use GARCH volatility modeling features (helps capture volatility clustering in price time series)')
+    parser.add_argument('--use_bollinger', action='store_true', default=True,
+                       help='Whether to use Bollinger Bands indicators (helps identify overbought/oversold conditions)')
+    parser.add_argument('--use_macd', action='store_true', default=True,
+                       help='Whether to use MACD indicators (helps identify trend strength and potential reversals)')
+    parser.add_argument('--use_moving_avg', action='store_true', default=False,
+                       help='Whether to use Moving Average indicators (helps identify trends and support/resistance levels)')
     parser.add_argument('--sequence_length', type=int, default=10, 
                         help='Sequence length for time series prediction')
     parser.add_argument('--test_size', type=float, default=0.2, 
                         help='Proportion of data to use for testing')
-    parser.add_argument('--target_column', type=str, default='price', choices=['price', 'direction'],
-                        help='Target column to predict (price or direction)')
+    parser.add_argument('--target_column', type=str, default='log_return', 
+                     choices=['price', 'price_change', 'log_return', 'direction'],
+                     help='Target column to predict (price, price_change, log_return, or direction)')
+    
+    # New plotting parameter
+    parser.add_argument('--plot', action='store_true', default=False,
+                        help='Whether to generate plots for evaluation results')
     
     # Training parameters
-    parser.add_argument('--train', action='store_true',
+    parser.add_argument('--train', action='store_true', default=True,
                         help='Whether to train models or just evaluate existing ones')
-    parser.add_argument('--batch_size', type=int, default=64, 
+    parser.add_argument('--batch_size', type=int, default=128, 
                         help='Batch size for training')
     parser.add_argument('--epochs', type=int, default=20, 
                         help='Maximum number of training epochs')
     parser.add_argument('--cv_splits', type=int, default=3, 
                         help='Number of cross-validation splits')
-    parser.add_argument('--optimize', action='store_true',
+    parser.add_argument('--optimize', action='store_true', default=False,
                         help='Whether to optimize hyperparameters')
     parser.add_argument('--n_trials', type=int, default=10, 
                         help='Number of hyperparameter optimization trials')
@@ -226,15 +249,19 @@ if __name__ == "__main__":
     parser.add_argument('--verbosity', type=int, default=1, choices=[0, 1, 2],
                         help='Output verbosity level (0=minimal, 1=normal, 2=detailed)')
     
+    # New parameters
+    parser.add_argument('--cache', action='store_true', default=False, help='Use cached preprocessed data/models')
+    
     args = parser.parse_args()
     
     # Check if running without explicit command line arguments
-    # If so, set training to True by default
+    # If so, use these specific default settings
     if len(sys.argv) == 1:  # Only the script name in sys.argv, no other arguments
         args.train = True
-        args.optimize = True
+        # args.plot is now controlled by the --plot flag
+        # args.plot = True  # This was overriding the default False setting
         args.predict_days = 30
         args.n_trials = 10  # Reduce the number of trials for testing
-        print("Running with default settings: Training=ON, Optimization=ON, Trials=10")
+        print(f"Running with default settings: Training=ON, Plotting={'ON' if args.plot else 'OFF'}, Trials=10")
     
     main(args) 
