@@ -232,7 +232,7 @@ if __name__ == "__main__":
                         help='Whether to train models or just evaluate existing ones')
     parser.add_argument('--batch_size', type=int, default=128, 
                         help='Batch size for training')
-    parser.add_argument('--epochs', type=int, default=20, 
+    parser.add_argument('--epochs', type=int, default=30, 
                         help='Maximum number of training epochs')
     parser.add_argument('--cv_splits', type=int, default=3, 
                         help='Number of cross-validation splits')

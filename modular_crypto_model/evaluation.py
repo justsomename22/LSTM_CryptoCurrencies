@@ -143,8 +143,6 @@ def evaluate_model(trainer, crypto_id):
     metrics = calculate_standard_metrics(predictions, y_test)
     trainer.test_metrics[crypto_id] = metrics
     
-    # Print R² score explicitly
-    print(f"R² score for {crypto_id}: {metrics['r2_score']:.4f}")
     
     return metrics
 
