@@ -224,7 +224,7 @@ if __name__ == "__main__":
                      help='Target column to predict (price, price_change, log_return, or direction)')
     
     # New plotting parameter
-    parser.add_argument('--plot', action='store_true', default=False,
+    parser.add_argument('--plot', action='store_true', default=True,
                         help='Whether to generate plots for evaluation results')
     
     # Training parameters
